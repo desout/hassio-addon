@@ -37,6 +37,8 @@ RUN cp -r /diyHue-${DIYHUE_COMMIT}/BridgeEmulator/lights /opt/hue-emulator/
 RUN cp -r /diyHue-${DIYHUE_COMMIT}/BridgeEmulator/sensors /opt/hue-emulator/
 RUN cp -r /diyHue-${DIYHUE_COMMIT}/BridgeEmulator/HueObjects /opt/hue-emulator/
 RUN cp -r /diyHue-${DIYHUE_COMMIT}/BridgeEmulator/services /opt/hue-emulator/
+# Override the upstream Entertainment service with the local WLED multi-segment fix
+COPY entertainment.py /opt/hue-emulator/services/entertainment.py
 RUN cp -r /diyHue-${DIYHUE_COMMIT}/BridgeEmulator/configManager /opt/hue-emulator/
 RUN cp -r /diyHue-${DIYHUE_COMMIT}/BridgeEmulator/logManager /opt/hue-emulator/
 RUN cp -r /diyHue-${DIYHUE_COMMIT}/BridgeEmulator/HueEmulator3.py /opt/hue-emulator/
