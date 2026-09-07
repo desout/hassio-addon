@@ -115,7 +115,6 @@ def entertainmentService(group, user):
 
     opensslCmd = [_OPENSSL_BIN, 's_server', '-dtls', '-psk', user.client_key, '-psk_identity', user.username, '-nocert', '-accept', '2100', '-quiet']
     p = Popen(opensslCmd, stdin=PIPE, stdout=PIPE, stderr=PIPE)
-    bridgeConfig["groups"][group.id_v1].stream["_proc"] = p  # store for stop handler
     # Log any s_server stderr output (startup errors, handshake failures)
     def _log_stderr(proc, name):
         try:
@@ -129,7 +128,6 @@ def entertainmentService(group, user):
     if hueGroup != -1:  # If we have found a hue Brige containing a suitable entertainment group for at least one Lamp, we connect to it
         h = HueConnection(bridgeConfig["config"]["hue"]["ip"])
         h.connect(hueGroup, hueGroupLights)
-        bridgeConfig["groups"][group.id_v1].stream["_hue"] = h  # store for shutdown cleanup
         if h._connected == False:
             hueGroupLights = {} # on a failed connection, empty the list
 
@@ -357,39 +355,36 @@ def entertainmentService(group, user):
                             auth = {'username':bridgeConfig["config"]["mqtt"]["mqttUser"], 'password':bridgeConfig["config"]["mqtt"]["mqttPassword"]}
                         publish.multiple(mqttLights, hostname=bridgeConfig["config"]["mqtt"]["mqttServer"], port=bridgeConfig["config"]["mqtt"]["mqttPort"], auth=auth)
                     if len(wledLights) != 0:
-                        wled_udpmode = 4  # DNRGB
+                        wled_udpmode = 4  # DNRGB mode
                         wled_secstowait = 2
 
                         for ip, segment_map in wledLights.items():
-                            # Sort physical WLED segments by their LED start address
+                            # Sort WLED segments by physical LED start address.
                             segs = sorted(
                                 segment_map.values(),
                                 key=lambda s: int(s["start"])
                             )
 
-                            # We can combine segments only if:
-                            # 1. they use the same UDP port
-                            # 2. they form one continuous LED range
-                            # 3. the resulting DNRGB packet fits WLED's 489 LED limit
-                            ports = {int(s["udp_port"]) for s in segs}
-
+                            # Adjacent segments on the same WLED controller can be
+                            # sent as one DNRGB frame. This prevents WLED from
+                            # rendering intermediate states between segment packets,
+                            # which causes visible flicker in Entertainment mode.
+                            ports = {int(seg["udp_port"]) for seg in segs}
                             contiguous = all(
-                                int(segs[i]["start"]) + int(segs[i]["ledCount"])
-                                == int(segs[i + 1]["start"])
-                                for i in range(len(segs) - 1)
+                                int(segs[index]["start"]) + int(segs[index]["ledCount"])
+                                == int(segs[index + 1]["start"])
+                                for index in range(len(segs) - 1)
                             )
+                            total_leds = sum(int(seg["ledCount"]) for seg in segs)
 
-                            total_leds = sum(int(s["ledCount"]) for s in segs)
-
+                            # DNRGB supports up to 489 LEDs in one UDP packet.
                             if len(ports) == 1 and contiguous and total_leds <= 489:
-                                # Send all WLED segments as ONE realtime frame
                                 start = int(segs[0]["start"])
                                 color_data = bytearray()
 
                                 for seg in segs:
-                                    count = int(seg["ledCount"])
                                     rgb = bytes(seg["color"])
-                                    color_data.extend(rgb * count)
+                                    color_data.extend(rgb * int(seg["ledCount"]))
 
                                 udpdata = (
                                     bytes([wled_udpmode, wled_secstowait])
@@ -398,38 +393,39 @@ def entertainmentService(group, user):
                                 )
 
                                 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                                sock.sendto(
-                                    udpdata,
-                                    (ip.split(":")[0], int(segs[0]["udp_port"]))
-                                )
-                                sock.close()
-
+                                try:
+                                    sock.sendto(
+                                        udpdata,
+                                        (ip.split(":")[0], int(segs[0]["udp_port"]))
+                                    )
+                                finally:
+                                    sock.close()
                             else:
-                                # Fallback to original behaviour for non-contiguous segments
+                                # Preserve the old behaviour for non-contiguous
+                                # segments, mixed UDP ports, or oversized frames.
                                 for seg in segs:
                                     udphead = bytes([wled_udpmode, wled_secstowait])
                                     start_seg = int(seg["start"]).to_bytes(2, "big")
                                     color = bytes(
                                         seg["color"] * int(seg["ledCount"])
                                     )
-
                                     udpdata = udphead + start_seg + color
 
                                     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                                    sock.sendto(
-                                        udpdata,
-                                        (ip.split(":")[0], int(seg["udp_port"]))
-                                    )
-                                    sock.close()
-
+                                    try:
+                                        sock.sendto(
+                                            udpdata,
+                                            (ip.split(":")[0], int(seg["udp_port"]))
+                                        )
+                                    finally:
+                                        sock.close()
                     if len(hueGroupLights) != 0:
                         if logManager.logger.logLevel <= _logging.DEBUG:
                             _hue_send_count += 1
                             if _hue_send_count % 30 == 1:  # sample ~every 30 frames (~0.5s at 56fps)
                                 logging.debug("Hue relay: sending 1 batch DTLS frame with %d light(s) to bridge %s (frame #%d)",
-                                              len(hueGroupLights), bridgeConfig["config"]["hue"]["ip"], _hue_send_count)
+                                             len(hueGroupLights), bridgeConfig["config"]["hue"]["ip"], _hue_send_count)
                         h.send(hueGroupLights, hueGroup)
-
                     if len(non_UDP_lights) != 0:
                         light = non_UDP_lights[non_UDP_update_counter]
                         operation = skipSimilarFrames(light.id_v1, light.state["xy"], light.state["bri"])
@@ -476,19 +472,14 @@ def entertainmentService(group, user):
         logging.error("Entertainment Service error, stopping server and clearing state: %s", e, exc_info=True)
 
     p.kill()
-    # Only clean up if we own the stored references (prevent stale thread
-    # from corrupting a new session that started after us)
-    if bridgeConfig["groups"][group.id_v1].stream.get("_proc") is p:
-        bridgeConfig["groups"][group.id_v1].stream["owner"] = None
-        try:
-            h.disconnect()
-        except UnboundLocalError:
-            pass
-        bridgeConfig["groups"][group.id_v1].stream.pop("_hue", None)
-        bridgeConfig["groups"][group.id_v1].stream.pop("_proc", None)
-        bridgeConfig["groups"][group.id_v1].stream["active"] = False
-        for light in group.lights:
-             bridgeConfig["lights"][light().id_v1].state["mode"] = "homeautomation"
+    bridgeConfig["groups"][group.id_v1].stream["owner"] = None
+    try:
+        h.disconnect()
+    except UnboundLocalError:
+        pass
+    bridgeConfig["groups"][group.id_v1].stream["active"] = False
+    for light in group.lights:
+         bridgeConfig["lights"][light().id_v1].state["mode"] = "homeautomation"
     logging.info("Entertainment service stopped")
 
 def enableMusic(ip, host_ip):
